@@ -387,13 +387,54 @@ static void set_linkparams_link_type(struct ospf_interface *oi,
 	return;
 }
 
-static void set_linkparams_link_id(struct mpls_te_link *lp,
-				   struct in_addr link_id)
+static void set_linkparams_link_id(struct ospf_interface *oi,
+				   struct mpls_te_link *lp)
 {
+	struct ospf_neighbor *nbr;
+	int done = 0;
 
 	lp->link_id.header.type = htons(TE_LINK_SUBTLV_LINK_ID);
 	lp->link_id.header.length = htons(TE_LINK_SUBTLV_DEF_SIZE);
-	lp->link_id.value = link_id;
+	
+
+	/*
+	 * The Link ID is identical to the contents of the Link ID field
+	 * in the Router LSA for these link types.
+	 */
+	switch (oi->type) {
+	case OSPF_IFTYPE_POINTOPOINT:
+		/* Take the router ID of the neighbor. */
+		if ((nbr = ospf_nbr_lookup_ptop(oi))
+		    && nbr->state == NSM_Full) {
+			lp->link_id.value = nbr->router_id;
+			done = 1;
+		}
+		break;
+	case OSPF_IFTYPE_BROADCAST:
+	case OSPF_IFTYPE_NBMA:
+		/* Take the interface address of the designated router. */
+		if ((nbr = ospf_nbr_lookup_by_addr(oi->nbrs, &DR(oi))) == NULL)
+			break;
+
+		if (nbr->state == NSM_Full
+		    || (IPV4_ADDR_SAME(&oi->address->u.prefix4, &DR(oi))
+			&& ospf_nbr_count(oi, NSM_Full) > 0)) {
+			lp->link_id.value = DR(oi);
+			done = 1;
+		}
+		break;
+	default:
+		/* Not supported yet. */ /* XXX */
+		lp->link_id.header.type = htons(0);
+		break;
+	}
+
+	if (!done) {
+		struct in_addr mask;
+		masklen2ip(oi->address->prefixlen, &mask);
+		lp->link_id.value.s_addr =
+			oi->address->u.prefix4.s_addr & mask.s_addr;
+	}
 	return;
 }
 
@@ -911,32 +952,42 @@ void ospf_mpls_te_update_if(struct interface *ifp)
 	return;
 }
 
-/*
- * Just add interface and set available information. Other information
- * and flooding of LSA will be done later when adjacency will be up
- * See ospf_mpls_te_nsm_change() after
- */
+
 static void ospf_mpls_te_ism_change(struct ospf_interface *oi, int old_state)
-{
+{	
+	struct te_link_subtlv_link_type old_type;
+	struct te_link_subtlv_link_id old_id;
 
 	struct mpls_te_link *lp;
 
-	lp = lookup_linkparams_by_ifp(oi->ifp);
-	if (lp == NULL) {
+	if ((lp = lookup_linkparams_by_ifp(oi->ifp)) == NULL) {
 		flog_warn(
 			EC_OSPF_TE_UNEXPECTED,
-			"MPLS-TE (%s): Cannot get linkparams from OI(%s)?",
-			__func__, IF_NAME(oi));
+			"ospf_mpls_te_ism_change: Cannot get linkparams from OI(%s)?",
+			IF_NAME(oi));
 		return;
 	}
 
 	if (oi->area == NULL || oi->area->ospf == NULL) {
 		flog_warn(
 			EC_OSPF_TE_UNEXPECTED,
-			"MPLS-TE (%s): Cannot refer to OSPF from OI(%s)?",
-			__func__, IF_NAME(oi));
+			"ospf_mpls_te_ism_change: Cannot refer to OSPF from OI(%s)?",
+			IF_NAME(oi));
 		return;
 	}
+#ifdef notyet
+	if ((lp->area != NULL
+	     && !IPV4_ADDR_SAME(&lp->area->area_id, &oi->area->area_id))
+	    || (lp->area != NULL && oi->area == NULL)) {
+		/* How should we consider this case? */
+		flog_warn(
+			EC_OSPF_TE_UNEXPECTED,
+			"MPLS-TE: Area for OI(%s) has changed to [%s], flush previous LSAs",
+			IF_NAME(oi),
+			oi->area ? inet_ntoa(oi->area->area_id) : "N/A");
+		ospf_mpls_te_lsa_schedule(lp, FLUSH_THIS_LSA);
+	}
+#endif
 
 	/* Keep Area information in combination with linkparams. */
 	lp->area = oi->area;
@@ -946,9 +997,39 @@ static void ospf_mpls_te_ism_change(struct ospf_interface *oi, int old_state)
 	case ISM_DROther:
 	case ISM_Backup:
 	case ISM_DR:
-		/* Set Link type and Local IP addr */
+		old_type = lp->link_type;
+		old_id = lp->link_id;
+
+		/* Set Link type, Link ID, Local and Remote IP addr */
 		set_linkparams_link_type(oi, lp);
+		set_linkparams_link_id(oi, lp);
 		set_linkparams_lclif_ipaddr(lp, oi->address->u.prefix4);
+
+		if (oi->type == LINK_TYPE_SUBTLV_VALUE_PTP) {
+			struct prefix *pref = CONNECTED_PREFIX(oi->connected);
+			if (pref != NULL)
+				set_linkparams_rmtif_ipaddr(lp,
+							    pref->u.prefix4);
+		}
+
+		/* Update TE parameters */
+		update_linkparams(lp);
+
+		/* Try to Schedule LSA */
+		if ((ntohs(old_type.header.type)
+			     != ntohs(lp->link_type.header.type)
+		     || old_type.link_type.value
+				!= lp->link_type.link_type.value)
+		    || (ntohs(old_id.header.type)
+				!= ntohs(lp->link_id.header.type)
+			|| ntohl(old_id.value.s_addr)
+				   != ntohl(lp->link_id.value.s_addr))) {
+			if (CHECK_FLAG(lp->flags, LPFLG_LSA_ENGAGED))
+				ospf_mpls_te_lsa_schedule(lp, REFRESH_THIS_LSA);
+			else
+				ospf_mpls_te_lsa_schedule(lp,
+							  REORIGINATE_THIS_LSA);
+		}
 
 		break;
 	case ISM_Down:
@@ -962,105 +1043,21 @@ static void ospf_mpls_te_ism_change(struct ospf_interface *oi, int old_state)
 		}
 		break;
 	default:
+		lp->link_type.header.type = htons(0);
+		lp->link_id.header.type = htons(0);
 		break;
 	}
 
-	ote_debug("MPLS-TE (%s): Update Link parameters for interface %s",
-		  __func__, IF_NAME(oi));
+	// ote_debug("MPLS-TE (%s): Update Link parameters for interface %s",
+	// 	  __func__, IF_NAME(oi));
 
 	return;
 }
 
-/*
- * Complete TE info and schedule LSA flooding
- * Link-ID and Remote IP address must be set with neighbor info
- * which are only valid once NSM state is FULL
- */
+
 static void ospf_mpls_te_nsm_change(struct ospf_neighbor *nbr, int old_state)
 {
-	struct ospf_interface *oi = nbr->oi;
-	struct mpls_te_link *lp;
-
-	/* Process Link only when neighbor old or new state is NSM Full */
-	if (nbr->state != NSM_Full && old_state != NSM_Full)
-		return;
-
-	/* Get interface information for Traffic Engineering */
-	lp = lookup_linkparams_by_ifp(oi->ifp);
-	if (lp == NULL) {
-		flog_warn(
-			EC_OSPF_TE_UNEXPECTED,
-			"MPLS-TE (%s): Cannot get linkparams from OI(%s)?",
-			__func__, IF_NAME(oi));
-		return;
-	}
-
-	if (oi->area == NULL || oi->area->ospf == NULL) {
-		flog_warn(
-			EC_OSPF_TE_UNEXPECTED,
-			"MPLS-TE (%s): Cannot refer to OSPF from OI(%s)?",
-			__func__, IF_NAME(oi));
-		return;
-	}
-
-	/* Flush TE Opaque LSA if Neighbor State goes Down or Deleted */
-	if (OspfMplsTE.enabled
-	    && (nbr->state == NSM_Down || nbr->state == NSM_Deleted)) {
-		if (CHECK_FLAG(lp->flags, EXT_LPFLG_LSA_ENGAGED)) {
-			ote_debug(
-				"MPLS-TE (%s): Interface %s goes down: flush LSA",
-				__func__, IF_NAME(oi));
-			ospf_mpls_te_lsa_schedule(lp, FLUSH_THIS_LSA);
-		}
-		return;
-	}
-
-	/* Keep Area information in combination with SR info. */
-	lp->area = oi->area;
-
-	/*
-	 * The Link ID is identical to the contents of the Link ID field
-	 * in the Router LSA for these link types.
-	 */
-	switch (oi->state) {
-	case ISM_PointToPoint:
-		/* Set Link ID with neighbor Router ID */
-		set_linkparams_link_id(lp, nbr->router_id);
-		/* Set Remote IP address */
-		set_linkparams_rmtif_ipaddr(lp, nbr->address.u.prefix4);
-		break;
-
-	case ISM_DR:
-	case ISM_DROther:
-	case ISM_Backup:
-		/* Set Link ID with the Designated Router ID */
-		set_linkparams_link_id(lp, DR(oi));
-		break;
-
-	case ISM_Down:
-		/* State goes Down: Flush LSA if engaged */
-		if (OspfMplsTE.enabled
-		    && CHECK_FLAG(lp->flags, LPFLG_LSA_ENGAGED)) {
-			ote_debug(
-				"MPLS-TE (%s): Interface %s goes down: flush LSA",
-				__func__, IF_NAME(oi));
-			ospf_mpls_te_lsa_schedule(lp, FLUSH_THIS_LSA);
-		}
-		return;
-	default:
-		break;
-	}
-
-	ote_debug("MPLS-TE (%s): Add Link-ID %pI4 for interface %s ", __func__,
-		  &lp->link_id.value, oi->ifp->name);
-
-	/* Try to Schedule LSA */
-	if (OspfMplsTE.enabled) {
-		if (CHECK_FLAG(lp->flags, LPFLG_LSA_ENGAGED))
-			ospf_mpls_te_lsa_schedule(lp, REFRESH_THIS_LSA);
-		else
-			ospf_mpls_te_lsa_schedule(lp, REORIGINATE_THIS_LSA);
-	}
+	/* Nothing to do here */
 	return;
 }
 
